@@ -626,11 +626,16 @@ function Get-Parts($account, $all = $false) {
     $scArgs = @(); if ($NoShortcuts) { $scArgs = @("--drive-skip-shortcuts") }
     if ($script:wantMy) {
         $myExtra = @() + $scArgs
+        $chunked = $false
         if ($OwnedOnly) {
-            $ol = Update-OwnedList $account
-            if ($ol) { $myExtra += @("--files-from-raw", $ol) }
+            # Downloading: folder by folder (Backup-MyDriveChunked). Verify / sizes: one owner list.
+            if ($script:downloading) { $chunked = $true }
+            else {
+                $ol = Update-OwnedList $account
+                if ($ol) { $myExtra += @("--files-from-raw", $ol) }
+            }
         }
-        $parts += [pscustomobject]@{ Name = "Mi_unidad"; Dst = (Join-Path $root "Mi_unidad"); Extra = $myExtra }
+        $parts += [pscustomobject]@{ Name = "Mi_unidad"; Dst = (Join-Path $root "Mi_unidad"); Extra = $myExtra; Chunked = $chunked }
     }
     if ($withShared) {
         $sharedExtra = @("--drive-shared-with-me") + $scArgs
@@ -690,7 +695,10 @@ function Get-DupTarget($dst, $path, $k) {
 }
 
 function Save-Duplicates($account, $p, $src) {
-    $dups = Get-DuplicateGroups $src $p.Extra
+    Save-DupGroups $account $p $src (Get-DuplicateGroups $src $p.Extra)
+}
+
+function Save-DupGroups($account, $p, $src, $dups) {
     if ($dups.Count -eq 0) { return }
     $log = Join-Path $logDir "$($account.Folder)_$(Get-SafeName $p.Name)_duplicates_saved.log"
     Write-Host "     $($dups.Count) name(s) have several different files on Drive: saving every copy..." -ForegroundColor Yellow
@@ -979,6 +987,95 @@ function Compare-SharedWithMe {
     Write-Host "When downloading, choose E to get only the files from outside." -ForegroundColor DarkGray
 }
 
+# ---------- My Drive in chunks (own files only) ----------
+# Reads lsjson lines with owners. Returns the own paths (with $prefix in front), the counts,
+# the folders, and the own names that appear more than once (path -> IDs) for the duplicates step.
+function Split-ByOwner($account, $lines, $prefix) {
+    $r = [pscustomobject]@{ Own = (New-Object System.Collections.Generic.List[string]); OwnBytes = 0.0
+                            Others = 0; OthersBytes = 0.0; Dirs = @(); Dups = @{} }
+    $ids = @{}
+    foreach ($line in @($lines)) {
+        $t = "$line".Trim().TrimEnd(',')
+        if (-not $t.StartsWith("{")) { continue }
+        try { $o = $t | ConvertFrom-Json } catch { continue }
+        if ($o.IsDir) { $r.Dirs += "$($o.Path)"; continue }
+        $size = [double]$o.Size; if ($size -lt 0) { $size = 0 }
+        $owner = $(if ($o.Metadata -and $o.Metadata.owner) { "$($o.Metadata.owner)" } else { "" })
+        if ($owner -eq "" -or $owner -ieq $account.Email) {
+            $path = "$prefix$($o.Path)"
+            if ($ids.ContainsKey($path)) { [void]$ids[$path].Add($o.ID); continue }
+            $ids[$path] = New-Object System.Collections.ArrayList
+            [void]$ids[$path].Add($o.ID)
+            $r.Own.Add($path); $r.OwnBytes += $size
+        } else { $r.Others++; $r.OthersBytes += $size }
+    }
+    foreach ($k in $ids.Keys) { if ($ids[$k].Count -gt 1) { $r.Dups[$k] = $ids[$k] } }
+    return $r
+}
+
+# My Drive, own files only, in chunks: first the files at the top, then one top folder at a time.
+# Each chunk lists the owners of its own folder only and downloads right after, so the
+# download starts in seconds instead of after a listing of all of My Drive.
+# rclone --files-from-raw goes straight to the listed files and does not scan other folders.
+function Backup-MyDriveChunked($account, $p, $src) {
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    $chunkFile = Join-Path $stateDir "$($account.Folder)_owned_chunk.txt"
+    $listArgs = @("--files-only", "--metadata", "--drive-skip-shortcuts", "--drive-export-formats", $exportFormats) + $script:junkArgs
+    $base = @($p.Extra | Where-Object { $_ })
+
+    $top = Invoke-RcloneQuiet (@("lsjson", $src, "--max-depth", "1", "--metadata", "--drive-skip-shortcuts",
+                                "--drive-export-formats", $exportFormats) + $script:junkArgs) "Reading the top of My Drive..."
+    if ($script:rcExit -ne 0) {
+        Write-Log "OWNERS: could not read My Drive of $($account.Email) folder by folder; downloading all of My Drive instead." "Yellow"
+        Invoke-Part $account $p.Name $src $p.Dst $base
+        if (-not $script:diskFull) { Save-Duplicates $account $p $src }
+        return
+    }
+    $rootPart = Split-ByOwner $account $top ""
+    $chunks = @([pscustomobject]@{ Name = "(files at the top)"; Data = $rootPart }) +
+              @($rootPart.Dirs | Sort-Object | ForEach-Object { [pscustomobject]@{ Name = $_; Data = $null } })
+
+    $all = New-Object System.Collections.Generic.List[string]
+    $ownN = 0; $ownB = 0.0; $othN = 0; $othB = 0.0; $complete = $true
+    $n = 0
+    foreach ($c in $chunks) {
+        $n++
+        if ($script:diskFull) { $complete = $false; break }
+        $label = "Mi_unidad [$n of $($chunks.Count)] $($c.Name)"
+        $d = $c.Data
+        if ($null -eq $d) {
+            $lines = Invoke-RcloneQuiet (@("lsjson", "$src$($c.Name)", "-R") + $listArgs) "Owners in $($c.Name) ($n of $($chunks.Count))..." 120
+            if ($script:rcExit -ne 0) {
+                # Owners unknown: download the whole folder rather than miss files
+                Write-Log "OWNERS: could not list $($c.Name) for $($account.Email); downloading the whole folder." "Yellow"
+                $complete = $false
+                $glob = $c.Name -replace '([\\*?\[\]{}])', '\$1'
+                Invoke-Part $account $label $src $p.Dst ($base + @("--include", "/$glob/**"))
+                continue
+            }
+            $d = Split-ByOwner $account $lines "$($c.Name)/"
+        }
+        $ownN += $d.Own.Count; $ownB += $d.OwnBytes; $othN += $d.Others; $othB += $d.OthersBytes
+        $all.AddRange($d.Own)
+        if ($d.Own.Count -eq 0) { continue }
+        [IO.File]::WriteAllLines($chunkFile, $d.Own, $enc)
+        Write-Host "     $($c.Name): $($d.Own.Count) own files ($(Format-Bytes $d.OwnBytes)), $($d.Others) of other owners left out" -ForegroundColor DarkGray
+        Invoke-Part $account $label $src $p.Dst ($base + @("--files-from-raw", $chunkFile))
+        if (-not $script:diskFull) { Save-DupGroups $account $p $src $d.Dups }
+    }
+    Remove-Item -LiteralPath $chunkFile -Force -ErrorAction SilentlyContinue
+
+    if (-not $complete) { return }
+    # Every folder was listed: save the owner numbers and the full list (Verify reuses it)
+    $file = Get-OwnedListPath $account
+    [IO.File]::WriteAllLines($file, $all, $enc)
+    $st = Read-State $account
+    $st.MyOwnedFiles = $ownN; $st.MyOwnedBytes = $ownB; $st.MyOthersFiles = $othN; $st.MyOthersBytes = $othB
+    Write-State $account $st
+    $script:ownedDone[$account.Email] = $file
+    Write-Log "OWNERS: $($account.Email) My Drive: $ownN own files ($(Format-Bytes $ownB)), $othN files of other owners ($(Format-Bytes $othB))" "Cyan"
+}
+
 # ---------- download ----------
 # Copy one part with retries. Adds one row to $script:partResults.
 function Invoke-Part($account, $part, $src, $dst, $extra) {
@@ -1076,10 +1173,8 @@ function Backup-Account($account) {
     Write-Host "============================================" -ForegroundColor DarkGray
     Write-Log "BACKUP START: $($account.Email) (overwrite=$($script:overwrite -or $script:runOverwrite))" "Cyan"
 
-    # Sizes on Drive first (fills the MyDrive / Shared / Total columns)
-    Show-DriveSizes $account
-
-    # Enough free space on the backup disk?
+    # No full size measuring here, so the download starts right away (Refresh measures).
+    # The space check uses the sizes saved last time, if any; the disk-full guard stops it anyway.
     $st = Read-State $account
     $need = [double](Get-StateValue $st "MyDriveBytes" 0) + [double](Get-StateValue $st "SharedDrivesBytes" 0)
     if (-not (Get-StateValue $st "SharedSkipped" $false)) {
@@ -1087,7 +1182,7 @@ function Backup-Account($account) {
         else { $need += [double](Get-StateValue $st "SharedBytes" 0) }
     }
     $need -= [double](Get-StateValue $st "LocalBytes" 0)
-    try {
+    if ($need -gt 0) { try {
         $free = [double](Get-PSDrive -Name ($destination.Substring(0, 1))).Free
         Write-Host "Free space on $($destination.Substring(0, 2)) $(Format-Bytes $free)   still to download (about): $(Format-Bytes ([math]::Max(0, $need)))" -ForegroundColor DarkGray
         if ($need -gt $free) {
@@ -1095,8 +1190,9 @@ function Backup-Account($account) {
             if ($script:appMode) { Write-Log "Stopped: free up space on the disk first." "Red"; return }
             if ("$(Read-Host 'Download anyway? (Y/N)')".Trim().ToUpper() -ne "Y") { return }
         }
-    } catch { }
+    } catch { } }
 
+    $script:downloading = $true
     $parts = @(Get-Parts $account)
     if ($script:includeShared -and -not $script:choiceMadeForAll) {
         # Ask every time (also when it was skipped before), showing its size
@@ -1122,9 +1218,11 @@ function Backup-Account($account) {
         Write-State $account $state
         $parts = @(Get-Parts $account)
     }
+    $script:downloading = $false
 
     foreach ($p in $parts) {
         if ($script:diskFull) { break }
+        if ($p.Chunked) { Backup-MyDriveChunked $account $p $src; continue }
         Invoke-Part $account $p.Name $src $p.Dst $p.Extra
         if (-not $script:diskFull) { Save-Duplicates $account $p $src }
     }

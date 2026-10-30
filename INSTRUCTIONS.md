@@ -47,7 +47,7 @@ Click the account cards to select them (gold border), then press a button:
 | Button | What it does |
 |---|---|
 | **Download** | Copies everything, then checks it byte by byte when *Verify after download* is ticked |
-| **Sizes on Drive** | How much there is online |
+| **Sizes on Drive** | How much there is online (Download does not measure first, so it starts right away) |
 | **Verify** | Byte check (size + MD5) of what is already downloaded |
 | **SHA-256** | Checksum list to check a copy later |
 | **Clean Mac files** | Deletes `._name`, `.DS_Store` and `__MACOSX` files already downloaded (no content, only Mac Finder info) |
@@ -62,7 +62,7 @@ Options bar:
 - **Overwrite files already downloaded**: off = only new or changed files.
 - **Skip Mac junk files** (on by default): leaves out `._name`, `.DS_Store` and `__MACOSX` files that a Mac adds next to real files.
 - **Skip shortcuts** (on by default): Drive shortcuts point to files or folders that live elsewhere, so their content is downloaded a second time. Tick it to leave them out. Keep it off if a shortcut points to something outside these accounts.
-- **Only files owned by the account** (on by default): My Drive downloads only the files this account owns. Files owned by other people are left out, because they belong to the owner's backup. Before it starts, G Nexus lists the owners and writes in the output how many files and GB were left out. Careful with owners outside these accounts or already deleted: their files would be in no backup.
+- **Only files owned by the account** (on by default): My Drive downloads only the files this account owns. Files owned by other people are left out, because they belong to the owner's backup. It works in chunks: the files at the top of My Drive first, then one top folder at a time. For each chunk it reads the owners of that folder only and downloads it right away, so the download starts in seconds, even on a very big Drive. The output shows, per folder, how many files were left out. Careful with owners outside these accounts or already deleted: their files would be in no backup.
 - **Table view**: the old table instead of the cards. **Show console window**: also shows the black window of the next action.
 
 G Nexus remembers the ticked options and the selected accounts in `_gnexus\session.json` for next time. *Overwrite* always starts unticked.
