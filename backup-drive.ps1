@@ -455,7 +455,7 @@ function Get-DirBytes($dir) {
 # Place for one My Drive folder of $need bytes: the first place with room for what is still
 # missing there (+3 GB spare). $preferred (where it was saved before) is tried first.
 # When it fits nowhere as a whole, the place with the most free space is used anyway (the
-# disk-full guard stops it if it really fills up). $null = no place has even 5 GB free.
+# disk-full guard stops it if it really fills up). $null = no place is reachable.
 function Select-Location($need, $preferred, $sub) {
     $list = @(Get-Locations)
     if ($preferred) { $list = @($preferred) + @($list | Where-Object { $_ -ne $preferred }) }
@@ -468,8 +468,8 @@ function Select-Location($need, $preferred, $sub) {
         if ($free -ge ([math]::Max([double]0, $left) + 3GB)) { return $loc }
         if ($free -gt $bestFree) { $best = $loc; $bestFree = $free }
     }
-    if ($best -and $bestFree -ge 5GB) {
-        Write-Log "     Not enough room for all of it on one disk: using $best ($(Format-Bytes $bestFree) free). If it fills up, the download stops and you can add a place and press Continue." "Yellow"
+    if ($best) {
+        Write-Log "     WARNING: not enough room for all of it: using $best ($(Format-Bytes $bestFree) free). It only stops if the disk gets really full (under 2 GB); then free up space or add a place and press Continue." "Yellow"
         return $best
     }
     return $null
@@ -1168,7 +1168,7 @@ function Backup-MyDriveChunked($account, $p, $src) {
         # Where this folder fits (the place it started in, if it was paused there)
         $loc = Select-Location $d.OwnBytes $where[$c.Name] $(if ($null -eq $c.Data) { Join-Path (Join-Path $account.Folder "Mi_unidad") $c.Name } else { "" })
         if (-not $loc) {
-            Write-Log "NO SPACE: $($c.Name) needs about $(Format-Bytes $d.OwnBytes) and no place has even 5 GB free. Free up space or add a place in Settings > More places, then press Continue." "Red"
+            Write-Log "NO PLACE: $($c.Name) can't be saved because no download place is reachable (disk not plugged in?). Check Settings, then press Continue." "Red"
             $script:diskFull = $true
             continue
         }

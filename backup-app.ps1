@@ -1492,9 +1492,9 @@ $timer.add_Tick({
         if ($script:isDownload -and -not $script:paused -and $code -eq 0) { Clear-Resume }
         Set-Busy $false
         Update-Table
-        $lblStatus.Text = "Finished: $($script:running). Table updated."
+        $lblStatus.Text = "Finished at $((Get-Date).ToString('HH:mm')): $($script:running). Table updated."
         if ($script:paused) { $lblStatus.Text = "Paused: $($script:running). Press Continue when you want (also after closing G Nexus)." }
-        elseif ($code -eq 3) { $lblStatus.Text = "Stopped: the disk is full. Free up space, then press Continue." }
+        elseif ($code -eq 3) { $lblStatus.Text = "Stopped at $((Get-Date).ToString('HH:mm')): the disk is full. Free up space, then press Continue." }
         $script:paused = $false
         if (Test-Path -LiteralPath (Join-Path $logDir "errors.log")) {
             $ef = Get-Item -LiteralPath (Join-Path $logDir "errors.log")
