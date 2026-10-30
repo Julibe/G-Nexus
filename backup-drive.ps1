@@ -439,7 +439,8 @@ $script:diskFull = $false
 function Invoke-RcloneWithProgress($argList, $log, $activity) {
     $exe = (Get-Command rclone).Source
     $argString = ($argList | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join " "
-    $proc = Start-Process -FilePath $exe -ArgumentList $argString -NoNewWindow -PassThru
+    $errFile = [IO.Path]::GetTempFileName()
+    $proc = Start-Process -FilePath $exe -ArgumentList $argString -NoNewWindow -PassThru -RedirectStandardError $errFile
     $null = $proc.Handle   # keeps ExitCode readable after the process ends
     $frames = @('|', '/', '-', '\')
     $tick = 0
@@ -497,6 +498,20 @@ function Invoke-RcloneWithProgress($argList, $log, $activity) {
     }
     $proc.WaitForExit()
     Write-Progress -Activity "$activity   (press S to skip)" -Completed
+    # Why rclone stopped, when it failed (errors before the log file opens only go here)
+    if ($proc.ExitCode -ne 0 -and -not $script:diskFull -and -not $script:partSkipped) {
+        $err = @(Get-Content -LiteralPath $errFile -Encoding UTF8 -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match 'ERROR|CRITICAL|Fatal|Failed|error' -and $_ -notmatch "shared Google Drive client_id" } |
+            Select-Object -Last 3)
+        if (-not $err) {
+            $err = @(Get-Content -LiteralPath $log -Tail 400 -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match '"level":"error"' } | Select-Object -Last 3 |
+                ForEach-Object { try { $j = $_ | ConvertFrom-Json; "$($j.object): $($j.msg)" } catch { $_ } })
+        }
+        if (-not $err) { $err = @("rclone exit code $($proc.ExitCode)") }
+        foreach ($e in $err) { Write-Log "     rclone: $(if ("$e".Length -gt 300) { "$e".Substring(0, 300) + '...' } else { $e })" "Red" }
+    }
+    Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
     if ($script:diskFull) { return 98 }
     if ($script:partSkipped) { return 99 }
     return $proc.ExitCode
@@ -665,28 +680,61 @@ function Get-Parts($account, $all = $false) {
 }
 
 # ---------- duplicates: several files with the same name in one Drive folder ----------
-# A normal copy can only save one of them, so every copy is downloaded by its
-# Drive ID as "name (dup 1).ext", "name (dup 2).ext", ... next to the original.
+# Drive lets one folder hold several files with the same name; Windows does not.
+# Copies with the same content (same MD5) are kept once. When the contents differ, the
+# first copy keeps the normal name and the others are saved by Drive ID next to it as
+# "name (dup 2).ext", "name (dup 3).ext", ...
 
-# Returns @{ "folder/name.ext" = @(id1, id2, ...) } for names that appear more than once
+# One copy for each different content. Google Docs have no MD5: each one counts as different.
+function Select-DistinctCopies($copies) {
+    $seen = @{}
+    $out = New-Object System.Collections.ArrayList
+    foreach ($c in $copies) {
+        if ($c.Md5) {
+            if ($seen.ContainsKey($c.Md5)) { continue }
+            $seen[$c.Md5] = $true
+        }
+        [void]$out.Add($c)
+    }
+    return , $out
+}
+
+# Reads one lsjson line: $null for folders and other lines
+function Read-LsjsonFile($line) {
+    $t = "$line".Trim().TrimEnd(',')
+    if (-not $t.StartsWith("{")) { return $null }
+    try { $o = $t | ConvertFrom-Json } catch { return $null }
+    $md5 = ""; if ($o.Hashes -and $o.Hashes.md5) { $md5 = "$($o.Hashes.md5)" }
+    $size = [double]$o.Size; if ($size -lt 0) { $size = 0 }
+    $owner = $(if ($o.Metadata -and $o.Metadata.owner) { "$($o.Metadata.owner)" } else { "" })
+    return [pscustomobject]@{ Path = "$($o.Path)"; Id = "$($o.ID)"; Md5 = $md5; Size = $size; IsDir = [bool]$o.IsDir; Owner = $owner }
+}
+
+# Returns @{ "folder/name.ext" = @(copy1, copy2, ...) } for names that have 2 or more
+# different contents. Each copy is @{ Id; Md5; Size }.
 function Get-DuplicateGroups($src, $extra) {
     $groups = @{}
-    $lines = Invoke-RcloneQuiet (@("lsf", $src, "-R", "--files-only", "--format", "pi", "--separator", "|", "--drive-export-formats", $exportFormats) + $extra) "Looking for duplicate names..."
+    $lines = Invoke-RcloneQuiet (@("lsjson", $src, "-R", "--files-only", "--hash", "--hash-type", "MD5",
+                                   "--drive-export-formats", $exportFormats) + $extra + $script:junkArgs) "Looking for duplicate names..."
     foreach ($line in @($lines)) {
-        $cut = "$line".LastIndexOf("|")
-        if ($cut -lt 1) { continue }
-        $path = "$line".Substring(0, $cut)
-        $id   = "$line".Substring($cut + 1)
-        if (-not $groups.ContainsKey($path)) { $groups[$path] = New-Object System.Collections.ArrayList }
-        [void]$groups[$path].Add($id)
+        $f = Read-LsjsonFile $line
+        if ($null -eq $f -or $f.IsDir) { continue }
+        if (-not $groups.ContainsKey($f.Path)) { $groups[$f.Path] = New-Object System.Collections.ArrayList }
+        [void]$groups[$f.Path].Add($f)
     }
     $dups = @{}
-    foreach ($k in $groups.Keys) { if ($groups[$k].Count -gt 1) { $dups[$k] = $groups[$k] } }
+    foreach ($k in $groups.Keys) {
+        if ($groups[$k].Count -lt 2) { continue }
+        $d = Select-DistinctCopies $groups[$k]
+        if ($d.Count -gt 1) { $dups[$k] = $d }
+    }
     return $dups
 }
 
+# Copy 1 keeps the normal name; copy 2, 3, ... get " (dup N)"
 function Get-DupTarget($dst, $path, $k) {
     $rel  = $path -replace '/', '\'
+    if ($k -le 1) { return (Join-Path $dst $rel) }
     $dir  = [IO.Path]::GetDirectoryName($rel)
     $leaf = [IO.Path]::GetFileName($rel)
     $name = "$([IO.Path]::GetFileNameWithoutExtension($leaf)) (dup $k)$([IO.Path]::GetExtension($leaf))"
@@ -701,15 +749,19 @@ function Save-Duplicates($account, $p, $src) {
 function Save-DupGroups($account, $p, $src, $dups) {
     if ($dups.Count -eq 0) { return }
     $log = Join-Path $logDir "$($account.Folder)_$(Get-SafeName $p.Name)_duplicates_saved.log"
-    Write-Host "     $($dups.Count) name(s) have several different files on Drive: saving every copy..." -ForegroundColor Yellow
+    $extra = @($p.Extra | Where-Object { $_ })
+    Write-Host "     $($dups.Count) name(s) have several different files on Drive: saving each different one..." -ForegroundColor Yellow
     foreach ($path in $dups.Keys) {
         $k = 1
-        foreach ($id in $dups[$path]) {
+        foreach ($c in $dups[$path]) {
             $target = Get-DupTarget $p.Dst $path $k
-            if ($script:overwrite -or $script:runOverwrite -or -not (Test-Path -LiteralPath $target)) {
+            $need = $script:overwrite -or $script:runOverwrite -or -not (Test-Path -LiteralPath $target)
+            # The normal name may hold another copy (rclone picks one): replace it when the size is not copy 1's
+            if (-not $need -and $k -eq 1 -and $c.Md5) { $need = ((Get-Item -LiteralPath $target).Length -ne [long]$c.Size) }
+            if ($need) {
                 New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName($target)) | Out-Null
-                $out = & rclone backend copyid $src $id $target --drive-export-formats $exportFormats @($p.Extra) 2>&1 | ForEach-Object { "$_" }
-                Add-Content -LiteralPath $log -Value "$path  id=$id  ->  $target  $($out -join ' ')"
+                $out = & rclone backend copyid $src $c.Id $target --drive-export-formats $exportFormats @extra 2>&1 | ForEach-Object { "$_" }
+                Add-Content -LiteralPath $log -Value "$path  id=$($c.Id)  ->  $target  $($out -join ' ')"
             }
             $k++
         }
@@ -993,23 +1045,22 @@ function Compare-SharedWithMe {
 function Split-ByOwner($account, $lines, $prefix) {
     $r = [pscustomobject]@{ Own = (New-Object System.Collections.Generic.List[string]); OwnBytes = 0.0
                             Others = 0; OthersBytes = 0.0; Dirs = @(); Dups = @{} }
-    $ids = @{}
+    $byPath = [ordered]@{}
     foreach ($line in @($lines)) {
-        $t = "$line".Trim().TrimEnd(',')
-        if (-not $t.StartsWith("{")) { continue }
-        try { $o = $t | ConvertFrom-Json } catch { continue }
-        if ($o.IsDir) { $r.Dirs += "$($o.Path)"; continue }
-        $size = [double]$o.Size; if ($size -lt 0) { $size = 0 }
-        $owner = $(if ($o.Metadata -and $o.Metadata.owner) { "$($o.Metadata.owner)" } else { "" })
-        if ($owner -eq "" -or $owner -ieq $account.Email) {
-            $path = "$prefix$($o.Path)"
-            if ($ids.ContainsKey($path)) { [void]$ids[$path].Add($o.ID); continue }
-            $ids[$path] = New-Object System.Collections.ArrayList
-            [void]$ids[$path].Add($o.ID)
-            $r.Own.Add($path); $r.OwnBytes += $size
-        } else { $r.Others++; $r.OthersBytes += $size }
+        $f = Read-LsjsonFile $line
+        if ($null -eq $f) { continue }
+        if ($f.IsDir) { $r.Dirs += $f.Path; continue }
+        if ($f.Owner -ne "" -and $f.Owner -ine $account.Email) { $r.Others++; $r.OthersBytes += $f.Size; continue }
+        $path = "$prefix$($f.Path)"
+        if (-not $byPath.Contains($path)) { $byPath[$path] = New-Object System.Collections.ArrayList }
+        [void]$byPath[$path].Add($f)
     }
-    foreach ($k in $ids.Keys) { if ($ids[$k].Count -gt 1) { $r.Dups[$k] = $ids[$k] } }
+    foreach ($path in $byPath.Keys) {
+        $copies = Select-DistinctCopies $byPath[$path]
+        foreach ($c in $copies) { $r.OwnBytes += $c.Size }
+        # One content: rclone downloads it. Several: the duplicates step saves each one by ID.
+        if ($copies.Count -gt 1) { $r.Dups[$path] = $copies } else { $r.Own.Add($path) }
+    }
     return $r
 }
 
@@ -1020,10 +1071,10 @@ function Split-ByOwner($account, $lines, $prefix) {
 function Backup-MyDriveChunked($account, $p, $src) {
     $enc = New-Object System.Text.UTF8Encoding($false)
     $chunkFile = Join-Path $stateDir "$($account.Folder)_owned_chunk.txt"
-    $listArgs = @("--files-only", "--metadata", "--drive-skip-shortcuts", "--drive-export-formats", $exportFormats) + $script:junkArgs
+    $listArgs = @("--files-only", "--metadata", "--hash", "--hash-type", "MD5", "--drive-skip-shortcuts", "--drive-export-formats", $exportFormats) + $script:junkArgs
     $base = @($p.Extra | Where-Object { $_ })
 
-    $top = Invoke-RcloneQuiet (@("lsjson", $src, "--max-depth", "1", "--metadata", "--drive-skip-shortcuts",
+    $top = Invoke-RcloneQuiet (@("lsjson", $src, "--max-depth", "1", "--metadata", "--hash", "--hash-type", "MD5", "--drive-skip-shortcuts",
                                 "--drive-export-formats", $exportFormats) + $script:junkArgs) "Reading the top of My Drive..."
     if ($script:rcExit -ne 0) {
         Write-Log "OWNERS: could not read My Drive of $($account.Email) folder by folder; downloading all of My Drive instead." "Yellow"
@@ -1055,12 +1106,13 @@ function Backup-MyDriveChunked($account, $p, $src) {
             }
             $d = Split-ByOwner $account $lines "$($c.Name)/"
         }
-        $ownN += $d.Own.Count; $ownB += $d.OwnBytes; $othN += $d.Others; $othB += $d.OthersBytes
-        $all.AddRange($d.Own)
-        if ($d.Own.Count -eq 0) { continue }
-        [IO.File]::WriteAllLines($chunkFile, $d.Own, $enc)
-        Write-Host "     $($c.Name): $($d.Own.Count) own files ($(Format-Bytes $d.OwnBytes)), $($d.Others) of other owners left out" -ForegroundColor DarkGray
-        Invoke-Part $account $label $src $p.Dst ($base + @("--files-from-raw", $chunkFile))
+        $ownN += $d.Own.Count + $d.Dups.Count; $ownB += $d.OwnBytes; $othN += $d.Others; $othB += $d.OthersBytes
+        $all.AddRange($d.Own); foreach ($k in $d.Dups.Keys) { $all.Add($k) }
+        Write-Host "     $($c.Name): $($d.Own.Count + $d.Dups.Count) own files ($(Format-Bytes $d.OwnBytes)), $($d.Others) of other owners left out" -ForegroundColor DarkGray
+        if ($d.Own.Count -gt 0) {
+            [IO.File]::WriteAllLines($chunkFile, $d.Own, $enc)
+            Invoke-Part $account $label $src $p.Dst ($base + @("--files-from-raw", $chunkFile))
+        }
         if (-not $script:diskFull) { Save-DupGroups $account $p $src $d.Dups }
     }
     Remove-Item -LiteralPath $chunkFile -Force -ErrorAction SilentlyContinue
@@ -1081,7 +1133,7 @@ function Backup-MyDriveChunked($account, $p, $src) {
 function Invoke-Part($account, $part, $src, $dst, $extra) {
     Set-Activity Download "$($account.Email) $part"
     $stamp = Get-Date -Format "yyyy-MM-dd_HHmm"
-    $log   = Join-Path $logDir "$($account.Folder)_$(Get-SafeName $part)_$stamp.log"
+    $log   = Join-Path $logDir "$($account.Folder)_$(($part -replace '[^\w\-]+', '_').Trim('_'))_$stamp.log"
 
     $rcArgs = @(
         "--transfers", "$transfers",
@@ -1104,6 +1156,8 @@ function Invoke-Part($account, $part, $src, $dst, $extra) {
     )
     if ($script:overwrite -or $script:runOverwrite) { $rcArgs += "--ignore-times" }
     $rcArgs += $extra
+    # A --files-from-raw list is already without Mac files; rclone does not mix it with --exclude rules
+    $filterArgs = $(if (@($extra) -contains "--files-from-raw") { @() } else { $script:junkArgs })
 
     Write-Host ""
     Write-Host "  -> Download: $part" -ForegroundColor Cyan
@@ -1115,7 +1169,7 @@ function Invoke-Part($account, $part, $src, $dst, $extra) {
             Write-Log "Retry $($try - 1) of ${retries}: $($account.Email) / $part" "Yellow"
             Start-Sleep -Seconds 30
         }
-        $code = Invoke-RcloneWithProgress (@("copy", $src, $dst) + $rcArgs + $script:junkArgs) $log "Download $($account.Email) / $part"
+        $code = Invoke-RcloneWithProgress (@("copy", $src, $dst) + $rcArgs + $filterArgs) $log "Download $($account.Email) / $part"
         if ($code -eq 0) { $ok = $true; break }
         if ($script:partSkipped -or $script:diskFull) { break }
     }
