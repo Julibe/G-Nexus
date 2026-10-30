@@ -1156,6 +1156,8 @@ function Invoke-Part($account, $part, $src, $dst, $extra) {
     )
     if ($script:overwrite -or $script:runOverwrite) { $rcArgs += "--ignore-times" }
     $rcArgs += $extra
+    # A --files-from-raw list is already without Mac files; rclone does not mix it with --exclude rules
+    $filterArgs = $(if (@($extra) -contains "--files-from-raw") { @() } else { $script:junkArgs })
 
     Write-Host ""
     Write-Host "  -> Download: $part" -ForegroundColor Cyan
@@ -1167,7 +1169,7 @@ function Invoke-Part($account, $part, $src, $dst, $extra) {
             Write-Log "Retry $($try - 1) of ${retries}: $($account.Email) / $part" "Yellow"
             Start-Sleep -Seconds 30
         }
-        $code = Invoke-RcloneWithProgress (@("copy", $src, $dst) + $rcArgs + $script:junkArgs) $log "Download $($account.Email) / $part"
+        $code = Invoke-RcloneWithProgress (@("copy", $src, $dst) + $rcArgs + $filterArgs) $log "Download $($account.Email) / $part"
         if ($code -eq 0) { $ok = $true; break }
         if ($script:partSkipped -or $script:diskFull) { break }
     }
