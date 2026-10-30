@@ -1,0 +1,12 @@
+{
+  "Destination": "",
+  "ClientId": "",
+  "ClientSecret": "",
+  "IncludeTrash": false,
+  "SkipJunk": true,
+  "Transfers": 8,
+  "Checkers": 8,
+  "BwLimit": "",
+  "Retries": 2,
+  "ExportFormats": "docx,xlsx,pptx,pdf,odt,ods,odp,csv,tsv,rtf,txt,html,epub,md,json,svg"
+}
