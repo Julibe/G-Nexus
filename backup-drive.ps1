@@ -1123,7 +1123,10 @@ function Backup-MyDriveChunked($account, $p, $src) {
     # Finished chunks are written down, so a paused download continues where it was
     $doneFile = Join-Path $stateDir "$($account.Folder)_chunks_done.txt"
     $done = New-Object 'System.Collections.Generic.HashSet[string]'
-    if ($Resume -and (Test-Path -LiteralPath $doneFile)) { foreach ($l in Get-Content -LiteralPath $doneFile -Encoding UTF8) { [void]$done.Add("$l") } }
+    # Kept between runs (also after a normal Download), so finished folders can be zipped and
+    # deleted from the disk without being downloaded again. Overwrite starts from zero.
+    $fresh = $script:overwrite -or $script:runOverwrite
+    if (-not $fresh -and (Test-Path -LiteralPath $doneFile)) { foreach ($l in Get-Content -LiteralPath $doneFile -Encoding UTF8) { [void]$done.Add("$l") } }
     else { Remove-Item -LiteralPath $doneFile -Force -ErrorAction SilentlyContinue }
     # Which place each folder was saved in (kept, so the next run checks the same place)
     $whereFile = Join-Path $stateDir "$($account.Folder)_locations.txt"
@@ -1142,7 +1145,7 @@ function Backup-MyDriveChunked($account, $p, $src) {
         if ($script:diskFull) { $complete = $false; break }
         $label = "Mi_unidad [$n of $($chunks.Count)] $($c.Name)"
         if ($done.Contains($c.Name)) {
-            Write-Host "     $($c.Name): already finished before the pause" -ForegroundColor DarkGray
+            Write-Host "     $($c.Name): already finished (skipped)" -ForegroundColor DarkGray
             $complete = $false   # its owners were not listed this time
             continue
         }
