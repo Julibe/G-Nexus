@@ -455,7 +455,7 @@ function Get-DirBytes($dir) {
 # Place for one My Drive folder of $need bytes: the first place with room for what is still
 # missing there (+3 GB spare). $preferred (where it was saved before) is tried first.
 # When it fits nowhere as a whole, the place with the most free space is used anyway (the
-# disk-full guard stops it if it really fills up). $null = no place has even 5 GB free.
+# disk-full guard stops it if it really fills up). $null = no place is reachable.
 function Select-Location($need, $preferred, $sub) {
     $list = @(Get-Locations)
     if ($preferred) { $list = @($preferred) + @($list | Where-Object { $_ -ne $preferred }) }
@@ -468,8 +468,8 @@ function Select-Location($need, $preferred, $sub) {
         if ($free -ge ([math]::Max([double]0, $left) + 3GB)) { return $loc }
         if ($free -gt $bestFree) { $best = $loc; $bestFree = $free }
     }
-    if ($best -and $bestFree -ge 5GB) {
-        Write-Log "     Not enough room for all of it on one disk: using $best ($(Format-Bytes $bestFree) free). If it fills up, the download stops and you can add a place and press Continue." "Yellow"
+    if ($best) {
+        Write-Log "     WARNING: not enough room for all of it: using $best ($(Format-Bytes $bestFree) free). It only stops if the disk gets really full (under 2 GB); then free up space or add a place and press Continue." "Yellow"
         return $best
     }
     return $null
@@ -1168,7 +1168,7 @@ function Backup-MyDriveChunked($account, $p, $src) {
         # Where this folder fits (the place it started in, if it was paused there)
         $loc = Select-Location $d.OwnBytes $where[$c.Name] $(if ($null -eq $c.Data) { Join-Path (Join-Path $account.Folder "Mi_unidad") $c.Name } else { "" })
         if (-not $loc) {
-            Write-Log "NO SPACE: $($c.Name) needs about $(Format-Bytes $d.OwnBytes) and no place has even 5 GB free. Free up space or add a place in Settings > More places, then press Continue." "Red"
+            Write-Log "NO PLACE: $($c.Name) can't be saved because no download place is reachable (disk not plugged in?). Check Settings, then press Continue." "Red"
             $script:diskFull = $true
             continue
         }
@@ -1311,9 +1311,9 @@ function Backup-Account($account) {
         $free = [double](Get-PSDrive -Name ($destination.Substring(0, 1))).Free
         Write-Host "Free space on $($destination.Substring(0, 2)) $(Format-Bytes $free)   still to download (about): $(Format-Bytes ([math]::Max([double]0, $need)))" -ForegroundColor DarkGray
         if ($need -gt $free) {
-            Write-Log "NOT ENOUGH SPACE for $($account.Email): needs about $(Format-Bytes $need), free $(Format-Bytes $free)" "Red"
-            if ($script:appMode) { Write-Log "Stopped: free up space on the disk first." "Red"; return }
-            if ("$(Read-Host 'Download anyway? (Y/N)')".Trim().ToUpper() -ne "Y") { return }
+            # Only a warning: finished folders may have been zipped and deleted (so the local size is low),
+            # each folder is checked before it starts and the disk-full guard stops it if it really fills up.
+            Write-Log "LOW SPACE for $($account.Email): needs about $(Format-Bytes $need), free $(Format-Bytes $free). Going on folder by folder; it stops if the disk gets full." "Yellow"
         }
     } catch { } }
 
