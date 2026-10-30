@@ -1311,9 +1311,9 @@ function Backup-Account($account) {
         $free = [double](Get-PSDrive -Name ($destination.Substring(0, 1))).Free
         Write-Host "Free space on $($destination.Substring(0, 2)) $(Format-Bytes $free)   still to download (about): $(Format-Bytes ([math]::Max([double]0, $need)))" -ForegroundColor DarkGray
         if ($need -gt $free) {
-            Write-Log "NOT ENOUGH SPACE for $($account.Email): needs about $(Format-Bytes $need), free $(Format-Bytes $free)" "Red"
-            if ($script:appMode) { Write-Log "Stopped: free up space on the disk first." "Red"; return }
-            if ("$(Read-Host 'Download anyway? (Y/N)')".Trim().ToUpper() -ne "Y") { return }
+            # Only a warning: finished folders may have been zipped and deleted (so the local size is low),
+            # each folder is checked before it starts and the disk-full guard stops it if it really fills up.
+            Write-Log "LOW SPACE for $($account.Email): needs about $(Format-Bytes $need), free $(Format-Bytes $free). Going on folder by folder; it stops if the disk gets full." "Yellow"
         }
     } catch { } }
 
