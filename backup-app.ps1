@@ -121,10 +121,11 @@ $cRowWait  = New-Color 70 62 28
 $cRowTotal = New-Color 34 60 104
 
 # ---------- engine ----------
-function Get-EngineArgs($action, $numbers) {
+function Get-EngineArgs($action, $numbers, $resume) {
     $a = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$engine`"", "-Action", $action, "-DataDir", "`"$($script:dataDir)`"")
     if ($numbers -and @($numbers).Count -gt 0) { $a += @("-Select", (@($numbers) -join ",")) }
-    if ($chkOverwrite.Checked) { $a += "-OverwriteAll" }
+    if ($resume) { $a += "-Resume" }   # continue: never overwrite what is already there
+    elseif ($chkOverwrite.Checked) { $a += "-OverwriteAll" }
     if (-not $chkVerify.Checked) { $a += "-NoVerify" }
     if (-not $chkJunk.Checked) { $a += "-KeepJunk" }
     if ($chkNoShortcuts.Checked) { $a += "-NoShortcuts" }
@@ -146,8 +147,42 @@ function Get-PartsArg {
     return ($pp -join ",")
 }
 
+# ---------- pause / continue ----------
+# A download writes resume.json when it starts and removes it when it ends normally.
+# Pause (or closing the app, a crash, a full disk) leaves it, so the download can continue later.
+function Get-ResumePath { return (Join-Path $script:cfgDir "resume.json") }
+function Read-Resume {
+    $f = Get-ResumePath
+    if (-not (Test-Path -LiteralPath $f)) { return $null }
+    try { return (Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
+function Write-Resume($action, $numbers, $text) {
+    try {
+        $emails = @(foreach ($n in @($numbers)) { if ($script:rowsByNum.ContainsKey([int]$n)) { "$(Get-RowValue $script:rowsByNum[[int]$n] 'Email')" } })
+        [ordered]@{ Action = $action; Emails = $emails; Text = $text; Time = (Get-Date -Format "yyyy-MM-dd HH:mm") } |
+            ConvertTo-Json | Set-Content -LiteralPath (Get-ResumePath) -Encoding UTF8
+    } catch { Save-AppErrors }
+}
+function Clear-Resume { Remove-Item -LiteralPath (Get-ResumePath) -Force -ErrorAction SilentlyContinue }
+function Update-ResumeButton {
+    $btnContinue.Enabled = ($null -ne (Read-Resume)) -and -not ($script:proc -and -not $script:proc.HasExited)
+}
+function Resume-Download {
+    $r = Read-Resume
+    if ($null -eq $r) { return }
+    $nums = @()
+    if ("$($r.Action)" -ne "A") {
+        foreach ($k in @($script:rowsByNum.Keys)) { if (@($r.Emails) -contains "$(Get-RowValue $script:rowsByNum[$k] 'Email')") { $nums += [int]$k } }
+        if ($nums.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("The paused accounts are not in the list any more:`n$(@($r.Emails) -join ', ')", "Continue") | Out-Null
+            Clear-Resume; Update-ResumeButton; return
+        }
+    }
+    Start-Engine "$($r.Action)" @($nums | Sort-Object) "$($r.Text) (continued)" -resume
+}
+
 # Runs one action in its own window; the table refreshes when it ends
-function Start-Engine($action, $numbers, $text) {
+function Start-Engine($action, $numbers, $text, [switch]$resume) {
     if ($script:proc -and -not $script:proc.HasExited) {
         [System.Windows.Forms.MessageBox]::Show("Something is already running: $($script:running)`nWait for it to finish, or press Stop.", "Busy") | Out-Null
         return
@@ -155,7 +190,11 @@ function Start-Engine($action, $numbers, $text) {
     Remove-Item -LiteralPath $progressFile, $skipFile -Force -ErrorAction SilentlyContinue
     $txtLog.Text = ""
     $style = $(if ($chkConsole.Checked) { "Normal" } else { "Hidden" })
-    $script:proc = Start-Process powershell -ArgumentList (Get-EngineArgs $action $numbers) -WindowStyle $style -PassThru
+    $script:isDownload = ($action -eq "Download" -or $action -eq "A")
+    if ($script:isDownload) { Write-Resume $action $numbers ($text -replace ' \(continued\)$', '') }
+    $script:paused = $false
+    $script:proc = Start-Process powershell -ArgumentList (Get-EngineArgs $action $numbers $resume) -WindowStyle $style -PassThru
+    $null = $script:proc.Handle   # keeps ExitCode readable after it ends
     $script:running = $text
     Set-Busy $true
     Show-Tab "Home"   # Skip / Stop are there
@@ -241,8 +280,10 @@ function Set-Busy($busy) {
     foreach ($b in $script:actionButtons) { $b.Enabled = -not $busy }
     $btnSkip.Enabled = $busy
     $btnStop.Enabled = $busy
+    $btnPause.Enabled = $busy -and $script:isDownload
+    Update-ResumeButton
     if ($busy) {
-        $lblStatus.Text = "RUNNING: $($script:running)   -   'Skip step' jumps over a stuck step, 'Stop' cancels"
+        $lblStatus.Text = "RUNNING: $($script:running)   -   'Pause' stops it so you can continue later, 'Stop' cancels"
         $lblStatus.ForeColor = New-Color 120 220 140
     } else {
         $lblStatus.ForeColor = $cText
@@ -809,7 +850,7 @@ function Show-SettingsForm {
 
     $sf = New-Object System.Windows.Forms.Form
     $sf.Text = "G Nexus - Settings"
-    $sf.Size = New-Object System.Drawing.Size(700, 640)
+    $sf.Size = New-Object System.Drawing.Size(700, 720)
     $sf.StartPosition = "CenterParent"
     if ($script:appIcon) { $sf.Icon = $script:appIcon }
     $sf.FormBorderStyle = "FixedDialog"
@@ -897,6 +938,22 @@ function Show-SettingsForm {
         if ($dlg.ShowDialog($sf) -eq "OK") { $tDest.Text = $dlg.SelectedPath }
     })
     $sf.Controls.Add($bBrowse)
+    $tMore = New-Object System.Windows.Forms.TextBox
+    $tMore.Multiline = $true
+    $tMore.ScrollBars = "Vertical"
+    $tMore.BorderStyle = "FixedSingle"
+    $tMore.Size = New-Object System.Drawing.Size(360, 50)
+    $tMore.Text = (@(Get-Val "MoreLocations" @()) | ForEach-Object { "$_" }) -join "`r`n"
+    Add-Row "More places" $tMore ""
+    $script:sfY += 26
+    $hMore = New-Object System.Windows.Forms.Label
+    $hMore.Text = "One folder per line, e.g. E:\Backups. When the first disk is full, My Drive folders go to the next place with room."
+    $hMore.ForeColor = $cDim
+    $hMore.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $hMore.Location = New-Object System.Drawing.Point(200, ($script:sfY - 6))
+    $hMore.Size = New-Object System.Drawing.Size(470, 30)
+    $sf.Controls.Add($hMore)
+    $script:sfY += 26
 
     Add-Section "Google app (your own, avoids 'Quota exceeded')"
     $tId = New-Text (Get-Val "ClientId" "") 460
@@ -993,6 +1050,7 @@ function Show-SettingsForm {
             Retries       = [int]$nRetries.Value
             BwLimit       = $bwText
             ExportFormats = $presets[$cFmt.SelectedIndex]
+            MoreLocations = @($tMore.Lines | ForEach-Object { "$_".Trim().TrimEnd('\') } | Where-Object { $_ })
         }
         try {
             $new | ConvertTo-Json | Set-Content -LiteralPath $script:settingsPath -Encoding UTF8
@@ -1178,10 +1236,17 @@ $btnSkip = Add-RibbonButton $gRun "Skip step" 0xE893 $icGold "Jump over the step
     Set-Content -LiteralPath $script:skipFile -Value "skip"
     $lblStatus.Text = "Skipping the current step..."
 } -always
+$btnPause = Add-RibbonButton $gRun "Pause" 0xE769 $icGold "Pause the download. Continue it later, also after closing G Nexus or turning off the PC." {
+    if ($script:proc -and -not $script:proc.HasExited) {
+        $script:paused = $true
+        & taskkill.exe /PID $script:proc.Id /T /F | Out-Null
+    }
+} -always
+$btnContinue = Add-RibbonButton $gRun "Continue" 0xE768 $icGreen "Continue the paused download where it stopped" { Resume-Download } -always
 $btnStop = Add-RibbonButton $gRun "Stop" 0xE71A $icRed "Cancel what is running (downloaded files are kept)" {
     if ($script:proc -and -not $script:proc.HasExited) {
-        $r = [System.Windows.Forms.MessageBox]::Show("Stop $($script:running)?`nFiles already downloaded are kept.", "Stop", "YesNo")
-        if ($r -eq "Yes") { & taskkill.exe /PID $script:proc.Id /T /F | Out-Null }
+        $r = [System.Windows.Forms.MessageBox]::Show("Stop $($script:running)?`nFiles already downloaded are kept.`n(To continue it later, use Pause instead.)", "Stop", "YesNo")
+        if ($r -eq "Yes") { Clear-Resume; & taskkill.exe /PID $script:proc.Id /T /F | Out-Null }
     }
 } -always
 $btnStopAll = Add-RibbonButton $gRun "Stop all" 0xE7BA $icRed "Stop EVERY backup running on this PC, also ones left in the background" {
@@ -1194,6 +1259,8 @@ $btnStopAll = Add-RibbonButton $gRun "Stop all" 0xE7BA $icRed "Stop EVERY backup
 } -always
 $btnSkip.Enabled = $false
 $btnStop.Enabled = $false
+$btnPause.Enabled = $false
+$btnContinue.Enabled = $false
 
 [void](New-TabPage "Accounts")
 $gAcc = New-Group "Accounts"
@@ -1419,10 +1486,16 @@ $timer.add_Tick({
     Update-Log
     Update-Progress
     if ($script:proc -and $script:proc.HasExited) {
+        $code = $script:proc.ExitCode
         $script:proc = $null
+        # Ended normally: nothing to continue. Paused, stopped by a full disk, or killed: keep it.
+        if ($script:isDownload -and -not $script:paused -and $code -eq 0) { Clear-Resume }
         Set-Busy $false
         Update-Table
         $lblStatus.Text = "Finished: $($script:running). Table updated."
+        if ($script:paused) { $lblStatus.Text = "Paused: $($script:running). Press Continue when you want (also after closing G Nexus)." }
+        elseif ($code -eq 3) { $lblStatus.Text = "Stopped: the disk is full. Free up space, then press Continue." }
+        $script:paused = $false
         if (Test-Path -LiteralPath (Join-Path $logDir "errors.log")) {
             $ef = Get-Item -LiteralPath (Join-Path $logDir "errors.log")
             if ($ef.LastWriteTime -gt (Get-Date).AddMinutes(-1)) { $lblStatus.Text += "  Some errors were logged: use 'Report for support' if something looks wrong." }
@@ -1443,7 +1516,7 @@ function Stop-EngineTree($procId) { & taskkill.exe /PID $procId /T /F | Out-Null
 $form.add_FormClosing({
     param($sender, $e)
     if ($script:proc -and -not $script:proc.HasExited) {
-        $r = [System.Windows.Forms.MessageBox]::Show("$($script:running) is still running.`n`nYes = stop it and close`nNo = close and let it keep running in the background`nCancel = don't close", "G Nexus", "YesNoCancel")
+        $r = [System.Windows.Forms.MessageBox]::Show("$($script:running) is still running.`n`nYes = pause it and close$(if ($script:isDownload) { ' (Continue next time)' })`nNo = close and let it keep running in the background`nCancel = don't close", "G Nexus", "YesNoCancel")
         if ($r -eq "Cancel") { $e.Cancel = $true; return }
         if ($r -eq "Yes") { Stop-EngineTree $script:proc.Id }
     }
@@ -1503,6 +1576,13 @@ $form.add_Shown({
     Update-Table
     Select-SessionAccounts
     Update-Log
+    # A download that was paused (or cut off) last time
+    $rs = Read-Resume
+    if ($null -ne $rs -and @(Get-EngineProcesses).Count -eq 0) {
+        $r = [System.Windows.Forms.MessageBox]::Show("A download was paused on $($rs.Time):`n$($rs.Text)`n`nContinue it now?`n(No = later, with the Continue button)", "Continue download", "YesNo", "Question")
+        if ($r -eq "Yes") { Resume-Download }
+    }
+    Update-ResumeButton
     $timer.Start()
 })
 

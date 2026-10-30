@@ -59,7 +59,8 @@ param(
     [switch]$NoShortcuts,     # skip Drive shortcuts (their files are not downloaded a second time)
     [switch]$OwnedOnly,       # My Drive: only files owned by the account itself
     [string]$Parts = "",      # which parts: "My,Shared,Drives,Trash" (empty = default from settings)
-    [string]$DataDir = ""     # backup folder; its _gnexus folder holds settings.json, accounts.csv, session.json
+    [string]$DataDir = "",    # backup folder; its _gnexus folder holds settings.json, accounts.csv, session.json
+    [switch]$Resume           # continue a paused download: My Drive folders already finished are not done again
 )
 # App mode: started by G Nexus in the background. No questions are asked (the app passes
 # the answers) and everything printed goes to _logs\app_output.log for the app to show.
@@ -134,7 +135,11 @@ if (Test-Path -LiteralPath $settingsFile) {
     if ($cfg.BwLimit)       { $bwLimit       = "$($cfg.BwLimit)".Trim() }
     if ($cfg.Retries)       { $retries       = [int]$cfg.Retries }
     if ($null -ne $cfg.SkipJunk) { $skipJunk = [bool]$cfg.SkipJunk }
+    if ($cfg.MoreLocations) { $script:moreLocations = @($cfg.MoreLocations | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) }
 }
+# More places to save to when the first disk is full (My Drive goes folder by folder:
+# each folder is saved where it fits). Every place gets the same <account>\Mi_unidad layout.
+if (-not $script:moreLocations) { $script:moreLocations = @() }
 if ($KeepJunk) { $skipJunk = $false }
 # Mac system files copied to Drive from a Mac: no user data, only Finder metadata.
 # Skipped in downloads, verify and sizes so the numbers stay comparable.
@@ -435,6 +440,22 @@ function Get-FreeBytes($path) {
     } catch { return $null }
 }
 $script:diskFull = $false
+$script:curDest = $null   # where the running download writes (for the disk-full guard)
+
+# All places backups are saved in: the main one first, then the extra ones (Settings)
+function Get-Locations { return @(@($destination) + @($script:moreLocations)) }
+
+# First place with room for $need bytes (+3 GB spare). $preferred is tried first. $null = none.
+function Select-Location($need, $preferred) {
+    $list = @(Get-Locations)
+    if ($preferred) { $list = @($preferred) + @($list | Where-Object { $_ -ne $preferred }) }
+    foreach ($loc in $list) {
+        $free = Get-FreeBytes $loc
+        if ($null -eq $free) { continue }   # disk not plugged in
+        if ($free -ge ([double]$need + 3GB)) { return $loc }
+    }
+    return $null
+}
 
 function Invoke-RcloneWithProgress($argList, $log, $activity) {
     $exe = (Get-Command rclone).Source
@@ -451,12 +472,12 @@ function Invoke-RcloneWithProgress($argList, $log, $activity) {
         Start-Sleep -Milliseconds 700
         # Disk full: stop instead of failing on every remaining file
         if ($tick % 10 -eq 0) {
-            $free = Get-FreeBytes $destination
+            $free = Get-FreeBytes $(if ($script:curDest) { $script:curDest } else { $destination })
             if ($null -ne $free -and $free -lt 2GB) {
                 try { & taskkill.exe /PID $proc.Id /T /F | Out-Null } catch { }
                 $script:diskFull = $true
                 Write-Host ""
-                Write-Log "DISK FULL: only $(Format-Bytes $free) left on the disk of $destination. Stopped. Free up space or choose another location, then download again (files already saved are kept)." "Red"
+                Write-Log "DISK FULL: only $(Format-Bytes $free) left on the disk of $(if ($script:curDest) { $script:curDest } else { $destination }). Stopped. Free up space or add another place in Settings > More places, then press Continue (files already saved are kept)." "Red"
                 break
             }
         }
@@ -610,12 +631,10 @@ function Get-StateValue($h, $key, $default) {
 
 # Files, folders and bytes in the account's Drive folders (Gmail and Contacts not counted)
 function Update-LocalStats($account, $state) {
-    $root = Join-Path $destination $account.Folder
     $files = 0; $folders = 0; $bytes = [double]0
     $subs = @("Mi_unidad", "Papelera", "Unidades_compartidas")
     if ($script:includeShared -and -not (Get-StateValue $state "SharedSkipped" $false)) { $subs += "Compartidos_conmigo" }
-    foreach ($sub in $subs) {
-        $dir = Join-Path $root $sub
+    foreach ($dir in @(foreach ($loc in Get-Locations) { foreach ($sub in $subs) { Join-Path (Join-Path $loc $account.Folder) $sub } })) {
         if (-not (Test-Path -LiteralPath $dir)) { continue }
         foreach ($item in Get-ChildItem -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue) {
             if ($item.PSIsContainer) { $folders++ } else { $files++; $bytes += $item.Length }
@@ -1083,6 +1102,17 @@ function Backup-MyDriveChunked($account, $p, $src) {
         return
     }
     $rootPart = Split-ByOwner $account $top ""
+    # Finished chunks are written down, so a paused download continues where it was
+    $doneFile = Join-Path $stateDir "$($account.Folder)_chunks_done.txt"
+    $done = New-Object 'System.Collections.Generic.HashSet[string]'
+    if ($Resume -and (Test-Path -LiteralPath $doneFile)) { foreach ($l in Get-Content -LiteralPath $doneFile -Encoding UTF8) { [void]$done.Add("$l") } }
+    else { Remove-Item -LiteralPath $doneFile -Force -ErrorAction SilentlyContinue }
+    # Which place each folder was saved in (kept, so the next run checks the same place)
+    $whereFile = Join-Path $stateDir "$($account.Folder)_locations.txt"
+    $where = @{}
+    if (Test-Path -LiteralPath $whereFile) {
+        foreach ($l in Get-Content -LiteralPath $whereFile -Encoding UTF8) { $t = "$l".Split("`t", 2); if ($t.Count -eq 2) { $where[$t[1]] = $t[0] } }
+    }
     $chunks = @([pscustomobject]@{ Name = "(files at the top)"; Data = $rootPart }) +
               @($rootPart.Dirs | Sort-Object | ForEach-Object { [pscustomobject]@{ Name = $_; Data = $null } })
 
@@ -1093,6 +1123,11 @@ function Backup-MyDriveChunked($account, $p, $src) {
         $n++
         if ($script:diskFull) { $complete = $false; break }
         $label = "Mi_unidad [$n of $($chunks.Count)] $($c.Name)"
+        if ($done.Contains($c.Name)) {
+            Write-Host "     $($c.Name): already finished before the pause" -ForegroundColor DarkGray
+            $complete = $false   # its owners were not listed this time
+            continue
+        }
         $d = $c.Data
         if ($null -eq $d) {
             $lines = Invoke-RcloneQuiet (@("lsjson", "$src$($c.Name)", "-R") + $listArgs) "Owners in $($c.Name) ($n of $($chunks.Count))..." 120
@@ -1109,11 +1144,25 @@ function Backup-MyDriveChunked($account, $p, $src) {
         $ownN += $d.Own.Count + $d.Dups.Count; $ownB += $d.OwnBytes; $othN += $d.Others; $othB += $d.OthersBytes
         $all.AddRange($d.Own); foreach ($k in $d.Dups.Keys) { $all.Add($k) }
         Write-Host "     $($c.Name): $($d.Own.Count + $d.Dups.Count) own files ($(Format-Bytes $d.OwnBytes)), $($d.Others) of other owners left out" -ForegroundColor DarkGray
+        # Where this folder fits (the place it started in, if it was paused there)
+        $loc = Select-Location $d.OwnBytes $where[$c.Name]
+        if (-not $loc) {
+            Write-Log "NO SPACE: $($c.Name) needs about $(Format-Bytes $d.OwnBytes) (+3 GB spare) and no place has that much free. Free up space or add a place in Settings > More places, then press Continue." "Red"
+            $script:diskFull = $true
+            continue
+        }
+        if ($where[$c.Name] -ne $loc) { $where[$c.Name] = $loc; Add-Content -LiteralPath $whereFile -Value "$loc`t$($c.Name)" -Encoding UTF8 }
+        $pc = [pscustomobject]@{ Name = $p.Name; Dst = (Join-Path (Join-Path $loc $account.Folder) "Mi_unidad"); Extra = $p.Extra }
+        if ($loc -ne $destination) { Write-Host "     $($c.Name) -> saved in $loc" -ForegroundColor Cyan }
+        $chunkOk = $true
         if ($d.Own.Count -gt 0) {
             [IO.File]::WriteAllLines($chunkFile, $d.Own, $enc)
-            Invoke-Part $account $label $src $p.Dst ($base + @("--files-from-raw", $chunkFile))
+            Invoke-Part $account $label $src $pc.Dst ($base + @("--files-from-raw", $chunkFile))
+            $chunkOk = (@($script:partResults)[-1].Download -eq "OK")
         }
-        if (-not $script:diskFull) { Save-DupGroups $account $p $src $d.Dups }
+        if ($script:diskFull) { continue }
+        Save-DupGroups $account $pc $src $d.Dups
+        if ($chunkOk) { Add-Content -LiteralPath $doneFile -Value $c.Name -Encoding UTF8 }
     }
     Remove-Item -LiteralPath $chunkFile -Force -ErrorAction SilentlyContinue
 
@@ -1132,6 +1181,7 @@ function Backup-MyDriveChunked($account, $p, $src) {
 # Copy one part with retries. Adds one row to $script:partResults.
 function Invoke-Part($account, $part, $src, $dst, $extra) {
     Set-Activity Download "$($account.Email) $part"
+    $script:curDest = $dst
     $stamp = Get-Date -Format "yyyy-MM-dd_HHmm"
     $log   = Join-Path $logDir "$($account.Folder)_$(($part -replace '[^\w\-]+', '_').Trim('_'))_$stamp.log"
 
@@ -1236,7 +1286,7 @@ function Backup-Account($account) {
         else { $need += [double](Get-StateValue $st "SharedBytes" 0) }
     }
     $need -= [double](Get-StateValue $st "LocalBytes" 0)
-    if ($need -gt 0) { try {
+    if ($need -gt 0 -and $script:moreLocations.Count -eq 0) { try {
         $free = [double](Get-PSDrive -Name ($destination.Substring(0, 1))).Free
         Write-Host "Free space on $($destination.Substring(0, 2)) $(Format-Bytes $free)   still to download (about): $(Format-Bytes ([math]::Max(0, $need)))" -ForegroundColor DarkGray
         if ($need -gt $free) {
@@ -1939,6 +1989,8 @@ while ($true) {
 Set-Activity Menu
 Save-ErrorLog
 Write-Host "Bye. Logs are in $logDir"
+# Exit code for the app: 3 = stopped because the disk is full (the download can be continued)
+if ($script:diskFull) { exit 3 }
 
 # ---------- HOW TO: your own Google OAuth client (fixes "Quota exceeded") ----------
 # Any Google account works (the admin one is best). Takes about 10 minutes, free.
