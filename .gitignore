@@ -1,0 +1,40 @@
+# G Nexus - only the app itself goes to GitHub.
+# Everything is ignored by default, then the app files are allowed one by one.
+# So backups, logs, accounts and passwords stay on your PC even if you add new folders.
+
+/*
+
+# App
+!/.gitignore
+!/.gitattributes
+!/LICENSE
+!/README.md
+!/backup-app.ps1
+!/backup-drive.ps1
+!/stop-all.ps1
+!/Backup.bat
+!/G Nexus.bat
+!/Backup-console.bat
+!/Stop all backups.bat
+!/INSTRUCTIONS.md
+
+# Logo and icon
+!/gnexus.ico
+!/gnexus-logo.png
+!/gnexus-symbol.png
+!/gnexus-wordmark.png
+
+# Templates (the real accounts.csv and settings.json are made from these on first run)
+!/accounts.example.csv
+!/settings.example.json
+
+# Never upload, even if someone allows them above by mistake
+accounts.csv
+settings.json
+session.json
+*.lnk
+*.log
+*.zip
+_logs/
+_app_error.txt
+rclone.conf
