@@ -465,7 +465,7 @@ function Select-Location($need, $preferred, $sub) {
         if ($null -eq $free) { continue }   # disk not plugged in
         $left = [double]$need
         if ($sub) { $left -= Get-DirBytes (Join-Path $loc $sub) }
-        if ($free -ge ([math]::Max(0, $left) + 3GB)) { return $loc }
+        if ($free -ge ([math]::Max([double]0, $left) + 3GB)) { return $loc }
         if ($free -gt $bestFree) { $best = $loc; $bestFree = $free }
     }
     if ($best -and $bestFree -ge 5GB) {
@@ -866,7 +866,7 @@ function Measure-MyDriveDetail($account, $state) {
     if ($all) { $state.MyAllFiles = $all.Files; $state.MyAllBytes = $all.Bytes }
     if ($all -and $noSc) {
         $state.MyShortcutFiles = [math]::Max(0, $all.Files - $noSc.Files)
-        $state.MyShortcutBytes = [math]::Max(0, $all.Bytes - $noSc.Bytes)
+        $state.MyShortcutBytes = [math]::Max([double]0, $all.Bytes - $noSc.Bytes)
         $state.MyNoShortcutFiles = $noSc.Files; $state.MyNoShortcutBytes = $noSc.Bytes
     }
     Write-State $account $state
@@ -1309,7 +1309,7 @@ function Backup-Account($account) {
     $need -= [double](Get-StateValue $st "LocalBytes" 0)
     if ($need -gt 0 -and $script:moreLocations.Count -eq 0) { try {
         $free = [double](Get-PSDrive -Name ($destination.Substring(0, 1))).Free
-        Write-Host "Free space on $($destination.Substring(0, 2)) $(Format-Bytes $free)   still to download (about): $(Format-Bytes ([math]::Max(0, $need)))" -ForegroundColor DarkGray
+        Write-Host "Free space on $($destination.Substring(0, 2)) $(Format-Bytes $free)   still to download (about): $(Format-Bytes ([math]::Max([double]0, $need)))" -ForegroundColor DarkGray
         if ($need -gt $free) {
             Write-Log "NOT ENOUGH SPACE for $($account.Email): needs about $(Format-Bytes $need), free $(Format-Bytes $free)" "Red"
             if ($script:appMode) { Write-Log "Stopped: free up space on the disk first." "Red"; return }
